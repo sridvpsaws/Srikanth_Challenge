@@ -1,0 +1,150 @@
+---
+- name: create vpc
+  ec2_vpc_net:
+    name: development
+    state: present
+    cidr_block: 10.0.0.0/16
+    tags: 
+      Environment: Development
+  register: vpc
+
+- debug: var=vpc
+
+- name: vpc internet gateway 
+  ec2_vpc_igw:
+    vpc_id: "{{ vpc.vpc.id }}"
+    state: present
+    region: us-east-1
+  register: igw
+
+- name: Create subnet
+  ec2_vpc_subnet:
+    state: present
+    region: us-east-1
+    az: us-east-1a
+    vpc_id: "{{ vpc.vpc.id }}" 
+    cidr: 10.0.0.0/24
+    resource_tags:
+      Name: Web subnet
+  register: web_subnet
+
+- debug: var=web_subnet
+
+
+- name: Create subnet
+  ec2_vpc_subnet:
+    state: present
+    region: us-east-1
+    az: us-east-1b
+    vpc_id: "{{ vpc.vpc.id }}"
+    cidr: 10.0.1.0/24
+    resource_tags:
+      Name: Web subnet1
+  register: web_subnet1
+
+- debug: var=web_subnet1
+
+- name: security group
+  ec2_group:
+    name: devsg
+    description: devsg
+    vpc_id: "{{ vpc.vpc.id }}" 
+    region: us-east-1
+    rules:
+     - proto: tcp
+       ports:
+       - 80
+       cidr_ip: 0.0.0.0/0
+       rule_desc: allow all on port 80
+  register: sg
+
+- debug: var=sg
+
+
+- name: create a new ec2 key pair, returns generated private key
+  ec2_key:
+    name: development
+  register: key
+
+- name: copy key to file 
+  lineinfile:
+    path: /tmp/development.pem
+    state: present
+    line: "{{ key.key.private_key }}"
+    create: yes
+    mode: 0400
+
+- name: Create EC2 instance
+  ec2:
+    key_name: development 
+    instance_type: t2.micro
+    assign_public_ip: yes
+    region: us-east-1
+    image: ami-0080e4c5bc078760e
+    vpc_subnet_id: "{{ web_subnet.subnet.id }}"
+    group_id: "{{ sg.group_id }}"
+    instance_tags:
+         Name: development
+         Project: test
+    user_data: "{{ lookup('file', 'userdata.sh') }}"
+    wait: yes
+  register: ec2    
+- debug: var=ec2
+
+- name: create target group for http
+  elb_target_group:
+    name: http80
+    protocol: http
+    port: 80
+    deregistration_delay_timeout: 300
+    stickiness_enabled: False
+    vpc_id: "{{ vpc.vpc.id }}"
+    health_check_path: /
+    successful_response_codes: "200"
+    targets:
+    - Id: "{{ ec2.instance_ids[0] }}"
+      Port: 80
+    state: present
+    wait: True
+  ignore_errors: true
+  register: tg
+
+- debug: var=tg  
+
+- name: ALB with listeners
+  elb_application_lb:
+    name: dev
+    subnets:
+      - "{{ web_subnet.subnet.id }}"
+      - "{{ web_subnet1.subnet.id }}"
+    security_groups:
+      - "{{ sg.group_id }}"
+    scheme: internet-facing
+    listeners:
+      - Protocol: HTTP
+        Port: 80
+        DefaultActions:
+          - Type: forward
+            TargetGroupName: http80
+    state: present
+  register: lb
+
+- debug: var=lb
+
+- ec2_lc:
+    name: dev
+    instance_id: "{{ ec2.instance_ids[0] }}"
+    instance_type: t2.micro
+    key_name: development
+    security_groups: [ "{{ sg.group_id }}" ]
+
+- ec2_asg:
+    name: dev
+    launch_config_name: dev
+    target_group_arns: [ "{{ lb.listeners[0].default_actions[0].target_group_arn }}" ] 
+    health_check_type: ELB
+    min_size: 1
+    max_size: 5
+    desired_capacity: 2
+    vpc_zone_identifier: [ "{{ web_subnet.subnet.id }}", "{{ web_subnet1.subnet.id }}" ]
+
